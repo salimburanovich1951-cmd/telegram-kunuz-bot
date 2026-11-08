@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import html
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import feedparser
 import requests
@@ -91,8 +92,50 @@ def save_sent_link(link):
 # Xotiradagi yuborilgan havolalar to'plami
 sent_links = load_sent_links()
 
-def send_to_telegram(text):
-    """Telegram guruhiga yoki kanaliga xabar yuborish funksiyasi"""
+def get_article_image(link):
+    """Maqola sahifasidan asosiy rasm havolasini ajratib olish"""
+    try:
+        resp = session.get(link, timeout=7)
+        if resp.status_code == 200:
+            # 1. Kun.uz Next.js storage rasmlarini qidirish
+            matches = re.findall(r'https://storage\.kun\.uz/source/[^"\'\s\\,]+\.(?:jpg|jpeg|png|webp)', resp.text)
+            if matches:
+                return matches[0]
+            # 2. og:image orqali tekshirish
+            og = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', resp.text)
+            if og and "og-default" not in og.group(1):
+                return og.group(1)
+    except Exception as e:
+        print(f"⚠️ Rasm yuklashda ogohlantirish: {e}")
+    return None
+
+def format_news_message(entry):
+    """Yangilik uchun sarlavha, mazmun, rukn va havolani chiroyli formatlash"""
+    title = html.escape(entry.get("title", "").strip())
+    summary = html.escape(entry.get("summary", "").strip())
+    link = entry.get("link", "")
+
+    # Rukn / Teg
+    tags = entry.get("tags", [])
+    tag_str = ""
+    if tags and isinstance(tags, list) and tags[0].get("term"):
+        term = tags[0].get("term").replace("-", "_").replace(" ", "_")
+        tag_str = f"🏷 #{term}\n"
+
+    # Telegram sendPhoto caption chegarasi 1024 belgi bo'lgani uchun matnni qisqartirish
+    max_summary_len = 650
+    if len(summary) > max_summary_len:
+        summary = summary[:max_summary_len] + "..."
+
+    if summary:
+        message = f"📰 <b>{title}</b>\n\n{summary}\n\n{tag_str}🔗 <a href='{link}'>Batafsil o'qish (Kun.uz)</a>"
+    else:
+        message = f"📰 <b>{title}</b>\n\n{tag_str}🔗 <a href='{link}'>Batafsil o'qish (Kun.uz)</a>"
+
+    return message
+
+def send_to_telegram(caption, image_url=None):
+    """Telegram guruhiga yoki kanaliga rasm va mazmuni bilan xabar yuborish funksiyasi"""
     if not TOKEN or TOKEN == "SIZNING_BOT_TOKENINGIZ":
         print("\n⚠️ DIQQAT: BOT_TOKEN ko'rsatilmagan!")
         return False
@@ -101,15 +144,35 @@ def send_to_telegram(text):
     if target_chat_id.startswith("100"):
         target_chat_id = f"-{target_chat_id}"
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
+    # 1. Agar rasm bo'lsa, avval rasm bilan yuborib ko'ramiz (sendPhoto)
+    if image_url:
+        photo_url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+        photo_payload = {
+            "chat_id": target_chat_id,
+            "photo": image_url,
+            "caption": caption,
+            "parse_mode": "HTML"
+        }
+        try:
+            res = session.post(photo_url, json=photo_payload, timeout=15)
+            data = res.json()
+            if data.get("ok"):
+                return True
+            else:
+                print(f"⚠️ sendPhoto xatosi ({data.get('description')}), matn sifatida yuboriladi...")
+        except Exception as e:
+            print(f"⚠️ sendPhoto ulanish xatosi: {e}, matn sifatida yuboriladi...")
+
+    # 2. Rasm bo'lmasa yoki sendPhoto xato bersa, sendMessage orqali matn yuborish
+    msg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    msg_payload = {
         "chat_id": target_chat_id,
-        "text": text,
+        "text": caption,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False  # Rasm/prevyu ko'rinishi uchun
+        "disable_web_page_preview": False
     }
     try:
-        response = session.post(url, json=payload, timeout=15)
+        response = session.post(msg_url, json=msg_payload, timeout=15)
         res_data = response.json()
         if res_data.get("ok"):
             return True
@@ -124,7 +187,8 @@ def check_news(is_startup=False):
     """Kun.uz RSS lentasini tekshirish va yangiliklarni yuborish"""
     print(f"[{time.strftime('%H:%M:%S')}] Yangiliklar tekshirilmoqda...")
     try:
-        feed = feedparser.parse(RSS_URL)
+        resp = session.get(RSS_URL, timeout=10)
+        feed = feedparser.parse(resp.content)
     except Exception as e:
         print(f"❌ RSS o'qishda xatolik: {e}")
         return
@@ -134,7 +198,6 @@ def check_news(is_startup=False):
         return
 
     # Agar bot mutlaqo birinchi marta ishga tushayotgan bo'lsa (sent_links bo'sh):
-    # Mavjud barcha yangiliklarni eslab qoladi va faqat 1 ta eng so'nggisini yuboradi
     if is_startup and not sent_links:
         print("ℹ️ Dastlabki ishga tushish: mavjud yangiliklar ro'yxatga olinmoqda...")
         for entry in feed.entries:
@@ -143,11 +206,11 @@ def check_news(is_startup=False):
                 save_sent_link(norm)
 
         latest_entry = feed.entries[0]
-        safe_title = html.escape(latest_entry.get("title", "").strip())
-        message = f"📰 <b>{safe_title}</b>\n\n🔗 <a href='{latest_entry.link}'>Batafsil o'qish</a>"
+        caption = format_news_message(latest_entry)
+        image_url = get_article_image(latest_entry.get("link"))
         print(f"Eng so'nggi yangilik yuborilmoqda: {latest_entry.title}")
-        if send_to_telegram(message):
-            print("✅ Dastlabki yangilik yuborildi va saqlandi.\n")
+        if send_to_telegram(caption, image_url):
+            print("✅ Dastlabki yangilik rasm va mazmuni bilan yuborildi.\n")
         return
 
     # Yangi xabarlarni saralash (avval yuborilmaganlari)
@@ -163,20 +226,19 @@ def check_news(is_startup=False):
 
     # Yangi xabarlarni xronologik tartibda (eskiroqdan yangiroqqa) yuborish
     for entry, norm_link in reversed(new_entries):
-        safe_title = html.escape(entry.get("title", "").strip())
-        message = f"📰 <b>{safe_title}</b>\n\n🔗 <a href='{entry.link}'>Batafsil o'qish</a>"
-        
-        # Takrorlanmasligi uchun darhol ro'yxatga saqlaymiz
         save_sent_link(norm_link)
+        caption = format_news_message(entry)
+        image_url = get_article_image(entry.get("link"))
         
-        if send_to_telegram(message):
-            print(f"✅ Yangi yangilik guruhga yuborildi: {entry.title}")
+        if send_to_telegram(caption, image_url):
+            print(f"✅ Yangi yangilik rasm va mazmuni bilan guruhga yuborildi: {entry.title}")
         time.sleep(2)  # Ketma-ket yuborilganda cheklovga tushmaslik uchun
 
 if __name__ == "__main__":
     print("=" * 50)
     print("🤖 Bot ishga tushdi!")
     print(f"Har {CHECK_INTERVAL} sekundda Kun.uz tekshirib boriladi.")
+    print("Yangiliklar fotosurati, qisqacha mazmuni va havolasi bilan yuboriladi.")
     print("To'xtatish uchun: Ctrl + C bosing.")
     print("=" * 50)
 
